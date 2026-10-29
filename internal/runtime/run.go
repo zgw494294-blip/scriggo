@@ -33,6 +33,16 @@ func (vm *VM) runFunc(fn *Function, vars []reflect.Value) error {
 	}
 	for {
 		err := vm.runRecoverable()
+		if err == errRangeReturn {
+			// A return statement has been executed in the body of a
+			// range-over-function loop. Complete the return, running the
+			// deferred calls of the iteration functions and then the
+			// deferred calls of the function that owns the body.
+			if !vm.beginRangeReturn() {
+				break
+			}
+			continue
+		}
 		if err == nil {
 			break
 		}
@@ -68,6 +78,11 @@ func (vm *VM) runRecoverable() (err error) {
 	defer func() {
 		if panicking {
 			msg := recover()
+			if rr, ok := msg.(rangeReturnPanic); ok {
+				vm.pendingRangeReturn = rr.st
+				err = errRangeReturn
+				return
+			}
 			err = vm.convertPanic(msg)
 		}
 	}()
@@ -266,7 +281,13 @@ func (vm *VM) run() (Addr, bool) {
 			vm.pc = 0
 		case OpCallIndirect:
 			f := vm.general(a).Interface().(*callable)
-			if f.fn == nil {
+			if f.yield != nil {
+				// Call of the implicit yield function of a
+				// range-over-function loop.
+				if addr, ok := vm.callRangeYield(f); !ok {
+					return addr, false
+				}
+			} else if f.fn == nil {
 				off := vm.fn.Body[vm.pc]
 				vm.callNative(f.Native(), c, StackShift{int8(off.Op), off.A, off.B, off.C}, startNativeGoroutine)
 				startNativeGoroutine = false
@@ -559,7 +580,30 @@ func (vm *VM) run() (Addr, bool) {
 				vm.fp[3] + Addr(off.C),
 			}
 			vm.swapStack(&vm.fp, &fp, StackShift{int8(arg.Op), arg.A, arg.B, arg.C})
-			vm.calls = append(vm.calls, callFrame{cl: *cl, renderer: vm.renderer, fp: fp, pc: 0, status: deferred, numVariadic: c})
+			frame := callFrame{cl: *cl, renderer: vm.renderer, fp: fp, pc: 0, status: deferred, numVariadic: c}
+			// A defer registered in the body of a range-over-function loop
+			// belongs to the function that owns the body, so it is inserted
+			// below the frames of the active iteration functions and run
+			// when that function returns.
+			if st := vm.ownerRangeState(); st != nil {
+				frame.rangeOwner = st.fn
+				// Insert the frame above the other deferred calls of the
+				// owning function and below the frames of the active
+				// iteration functions, so the deferred calls are run in
+				// LIFO order when the owning function returns.
+				pos := len(vm.calls)
+				for i, c := range vm.calls {
+					if c.status == started && c.rangeOwner == st.fn {
+						pos = i
+						break
+					}
+				}
+				vm.calls = append(vm.calls, callFrame{})
+				copy(vm.calls[pos+1:], vm.calls[pos:])
+				vm.calls[pos] = frame
+			} else {
+				vm.calls = append(vm.calls, frame)
+			}
 			vm.pc += 2
 
 		// Delete
@@ -1452,6 +1496,100 @@ func (vm *VM) run() (Addr, bool) {
 			vm.ok = vm.pc != endAddress
 			vm.pc = endAddress
 
+		// RangeFunc
+		case OpRangeFunc:
+			// Layout:
+			//
+			//		RangeFunc expr, index, elem
+			//		shift                       // frame shift of the
+			//		                            // interpreted iteration function
+			//		end address                 // address after the body
+			//		body ...
+			//		Continue range
+			shiftAddress := vm.pc
+			endAddress := Addr(decodeUint24(
+				vm.fn.Body[vm.pc+1].A,
+				vm.fn.Body[vm.pc+1].B,
+				vm.fn.Body[vm.pc+1].C,
+			))
+			vm.pc += 2
+			f := vm.general(a).Interface().(*callable)
+			st := &rangeFnState{
+				fn:           vm.fn,
+				fp:           vm.fp,
+				vars:         vm.vars,
+				renderer:     vm.renderer,
+				index:        b,
+				elem:         c,
+				rangeAddress: shiftAddress - 1,
+				bodyAddress:  shiftAddress + 2,
+				callerFP:     vm.fp,
+				returnPC:     endAddress,
+			}
+			vm.rangeStack = append(vm.rangeStack, st)
+			yield := &callable{yield: st}
+			if f.fn != nil {
+				// Call an interpreted iteration function.
+				st.interp = true
+				fn := f.fn
+				off := vm.fn.Body[shiftAddress]
+				call := callFrame{cl: callable{fn: vm.fn, vars: vm.vars}, renderer: vm.renderer, fp: vm.fp, pc: endAddress, rangeOwner: vm.fn}
+				// Nested range-over-function loops in the same frame call
+				// their iteration functions while an outer iteration
+				// function is still active, so their frames are positioned
+				// above the frames of the active iteration functions.
+				var extra [4]Addr
+				for _, s := range vm.rangeStack {
+					if s.interp && s.callerFP == vm.fp {
+						extra = s.frameSize
+						// There can be multiple nested loops, but frames are
+						// positioned at the innermost active frame.
+						break
+					}
+				}
+				vm.fp[0] += Addr(off.Op) + extra[0]
+				if vm.fp[0]+Addr(fn.NumReg[0]) > vm.st[0] {
+					vm.moreIntStack()
+				}
+				vm.fp[1] += Addr(off.A) + extra[1]
+				if vm.fp[1]+Addr(fn.NumReg[1]) > vm.st[1] {
+					vm.moreFloatStack()
+				}
+				vm.fp[2] += Addr(off.B) + extra[2]
+				if vm.fp[2]+Addr(fn.NumReg[2]) > vm.st[2] {
+					vm.moreStringStack()
+				}
+				vm.fp[3] += Addr(off.C) + extra[3]
+				if vm.fp[3]+Addr(fn.NumReg[3]) > vm.st[3] {
+					vm.moreGeneralStack()
+				}
+				st.frameSize = [4]Addr{
+					Addr(off.Op) + extra[0] + Addr(fn.NumReg[0]),
+					Addr(off.A) + extra[1] + Addr(fn.NumReg[1]),
+					Addr(off.B) + extra[2] + Addr(fn.NumReg[2]),
+					Addr(off.C) + extra[3] + Addr(fn.NumReg[3]),
+				}
+				// Put the yield callable in the first general register of
+				// the iteration function frame.
+				vm.setGeneral(1, reflect.ValueOf(yield))
+				vm.fn = fn
+				vm.vars = f.vars
+				vm.calls = append(vm.calls, call)
+				vm.pc = 0
+			} else {
+				// Call a native iteration function, passing it a Go function
+				// that executes the body of the range statement.
+				nf := f.Native()
+				yieldType := nf.value.Type().In(0)
+				yieldValue := reflect.MakeFunc(yieldType, func(args []reflect.Value) []reflect.Value {
+					cont, _ := vm.callRangeYieldBody(st, args)
+					return []reflect.Value{reflect.ValueOf(cont)}
+				})
+				nf.value.Call([]reflect.Value{yieldValue})
+				vm.rangeStack = vm.rangeStack[:len(vm.rangeStack)-1]
+				vm.pc = endAddress
+			}
+
 		// RangeString
 		case OpRangeString, -OpRangeString:
 			endAddress := vm.pc
@@ -1568,6 +1706,17 @@ func (vm *VM) run() (Addr, bool) {
 
 		// Return
 		case OpReturn:
+			// A return statement in the body of a range-over-function loop
+			// returns from the function that owns the body: finalize the
+			// result values, then unwind the active iteration functions,
+			// running their deferred calls, and finally the deferred calls
+			// of the owning function.
+			if st := vm.ownerRangeState(); st != nil {
+				if regs := vm.fn.FinalRegs; regs != nil {
+					vm.finalize(regs)
+				}
+				panic(rangeReturnPanic{st: st})
+			}
 			i := len(vm.calls) - 1
 			if i == -1 {
 				return maxUint32, false
@@ -1575,6 +1724,7 @@ func (vm *VM) run() (Addr, bool) {
 			call := vm.calls[i]
 			fn := call.cl.fn
 			if call.status == started {
+				vm.popRangeStateForCall(call)
 				if vm.fn.Macro {
 					if call.renderer != vm.renderer {
 						b := fn.Body[call.pc-2].B

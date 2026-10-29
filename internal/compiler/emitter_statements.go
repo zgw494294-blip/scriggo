@@ -146,7 +146,11 @@ func (em *emitter) emitNodes(nodes []ast.Node) {
 			em.breakLabel = currentBreakLabel
 
 		case *ast.ForRange:
-			em.emitForRange(node)
+			if em.typ(node.Assignment.Rhs[0]).Kind() == reflect.Func {
+				em.emitForRangeFunc(node)
+			} else {
+				em.emitForRange(node)
+			}
 
 		case *ast.Go:
 			call := node.Call.(*ast.Call)
@@ -1129,6 +1133,118 @@ func (em *emitter) emitForRange(node *ast.ForRange) {
 		em.emitNodes(node.Else.Nodes)
 		em.fb.exitScope()
 		em.fb.setLabelAddr(endForLabel)
+	}
+
+}
+
+// emitForRangeFunc emits a range statement over a function, as in Go 1.23:
+//
+//	for range f {}
+//	for v := range f {}
+//	for k, v := range f {}
+//
+// where f has type func(func() bool), func(func(V) bool) or
+// func(func(K, V) bool).
+func (em *emitter) emitForRangeFunc(node *ast.ForRange) {
+
+	inForRange := em.inForRange
+	em.inForRange = true
+
+	em.fb.enterScope()
+
+	vars := node.Assignment.Lhs
+	expr := node.Assignment.Rhs[0]
+	exprType := em.typ(expr)
+	exprReg := em.emitExpr(expr, exprType)
+
+	// The RangeFunc instruction knows nothing about indirect registers, so
+	// the iteration variables are declared in the same way as in emitForRange
+	// and, if they must be indirect because they are captured by a closure,
+	// a new pointer is allocated at every iteration.
+
+	var index, elem int8
+	var indirectIndex, indirectElem int8
+	var indexType, elemType reflect.Type
+	declaration := node.Assignment.Type == ast.AssignmentDeclaration
+
+	if len(vars) == 2 && !isBlankIdentifier(vars[0]) {
+		name := vars[0].(*ast.Identifier).Name
+		indexType = em.typ(vars[0])
+		if declaration {
+			index = em.fb.newRegister(indexType.Kind())
+			if em.varStore.mustBeDeclaredAsIndirect(vars[0].(*ast.Identifier)) {
+				indirectIndex = em.fb.newIndirectRegister()
+				em.fb.bindVarReg(name, indirectIndex)
+			} else {
+				em.fb.bindVarReg(name, index)
+			}
+		} else {
+			index = em.fb.scopeLookup(name)
+		}
+	}
+
+	if len(vars) == 2 && !isBlankIdentifier(vars[1]) {
+		name := vars[1].(*ast.Identifier).Name
+		elemType = em.typ(vars[1])
+		if declaration {
+			elem = em.fb.newRegister(elemType.Kind())
+			if em.varStore.mustBeDeclaredAsIndirect(vars[1].(*ast.Identifier)) {
+				indirectElem = em.fb.newIndirectRegister()
+				em.fb.bindVarReg(name, indirectElem)
+			} else {
+				em.fb.bindVarReg(name, elem)
+			}
+		} else {
+			elem = em.fb.scopeLookup(name)
+		}
+	}
+
+	rangeLabel := em.fb.newLabel()
+	em.fb.setLabelAddr(rangeLabel)
+	_, shiftAddr, endWordAddr := em.fb.emitRangeFunc(exprReg, index, elem)
+	endRange := em.fb.newLabel()
+	em.rangeLabels = append(em.rangeLabels, rangeLabel)
+	em.fb.enterScope()
+
+	if indirectIndex != 0 {
+		// Allocate a new pointer at every iteration, so a closure that
+		// captures the iteration variable captures the current value.
+		em.fb.emitNew(indexType, -indirectIndex)
+		em.changeRegister(false, index, indirectIndex, indexType, indexType)
+	}
+	if indirectElem != 0 {
+		em.fb.emitNew(elemType, -indirectElem)
+		em.changeRegister(false, elem, indirectElem, elemType, elemType)
+	}
+
+	em.emitNodes(node.Body)
+	em.fb.emitContinue(rangeLabel)
+	em.fb.setLabelAddr(endRange)
+	em.rangeLabels = em.rangeLabels[:len(em.rangeLabels)-1]
+	em.fb.exitScope()
+	em.fb.exitScope()
+	em.inForRange = inForRange
+
+	// Patch the address of the instruction after the body.
+	endAddress := em.fb.labelAddrs[endRange-1]
+	a, b, c := encodeUint24(uint32(endAddress))
+	em.fb.fn.Body[endWordAddr] = runtime.Instruction{A: a, B: b, C: c}
+
+	// Patch the frame shift of an interpreted iteration function with the
+	// high-water mark of the registers, so its frame does not overlap the
+	// registers used by the body while the body is executed as a yield
+	// callback.
+	shift := [4]int8{
+		em.fb.maxRegs[intRegister],
+		em.fb.maxRegs[floatRegister],
+		em.fb.maxRegs[stringRegister],
+		em.fb.maxRegs[generalRegister],
+	}
+	em.fb.fn.Body[shiftAddr] = runtime.Instruction{
+		Op:      runtime.Operation(shift[0]),
+		A:       shift[1],
+		B:       shift[2],
+		C:       shift[3],
 	}
 
 }
