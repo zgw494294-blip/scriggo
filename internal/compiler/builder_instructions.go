@@ -655,6 +655,23 @@ func (fb *functionBuilder) emitRange(k bool, s, i, e int8, kind reflect.Kind) {
 	fn.Body = append(fn.Body, runtime.Instruction{Op: op, A: s, B: i, C: e})
 }
 
+// emitRangeFunc appends a new "RangeFunc" instruction to the function body,
+// followed by the frame shift of the interpreted iteration function and the
+// address of the instruction after the body. It returns the addresses of the
+// instruction, the frame shift and the address.
+//
+//	for k, v := range f
+func (fb *functionBuilder) emitRangeFunc(f, i, e int8) (opAddr, shiftAddr, endAddr runtime.Addr) {
+	fn := fb.fn
+	opAddr = runtime.Addr(len(fn.Body))
+	fn.Body = append(fn.Body, runtime.Instruction{Op: runtime.OpRangeFunc, A: f, B: i, C: e})
+	shiftAddr = runtime.Addr(len(fn.Body))
+	fn.Body = append(fn.Body, runtime.Instruction{})
+	endAddr = runtime.Addr(len(fn.Body))
+	fn.Body = append(fn.Body, runtime.Instruction{})
+	return
+}
+
 // emitRealImag appends a new "RealImag" instruction to the function body.
 //
 //	y, z = real(x), imag(x)

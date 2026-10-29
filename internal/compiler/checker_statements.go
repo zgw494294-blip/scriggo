@@ -320,6 +320,45 @@ nodesLoop:
 				}
 				typ1 = typ.Elem()
 				maxLhs = 1
+			case reflect.Func:
+				// Range over a function, as in Go 1.23:
+				//
+				//   func(func() bool)
+				//   func(func(V) bool)
+				//   func(func(K, V) bool)
+				if typ.NumOut() != 0 || typ.NumIn() != 1 || typ.IsVariadic() {
+					panic(tc.errorf(node.Assignment.Rhs[0], "cannot range over %s (type %s)", expr, ti.StringWithNumber(true)))
+				}
+				yieldType := typ.In(0)
+				if yieldType.Kind() != reflect.Func || yieldType.NumOut() != 1 ||
+					yieldType.Out(0).Kind() != reflect.Bool || yieldType.IsVariadic() {
+					panic(tc.errorf(node.Assignment.Rhs[0], "cannot range over %s (type %s)", expr, ti.StringWithNumber(true)))
+				}
+				switch yieldType.NumIn() {
+				case 0:
+					if len(lhs) > 0 {
+						panic(tc.errorf(node, "too many variables in range"))
+					}
+					maxLhs = 0
+				case 1:
+					if len(lhs) > 1 {
+						panic(tc.errorf(node, "too many variables in range"))
+					}
+					typ1 = yieldType.In(0)
+					typ2 = yieldType.In(0)
+					// A single variable gets the value yielded by the
+					// function, so it is checked as the second variable.
+					if len(lhs) == 1 {
+						blank := ast.NewIdentifier(expr.Pos().WithEnd(expr.Pos().Start), "_")
+						lhs = []ast.Expression{blank, lhs[0]}
+						node.Assignment.Lhs = lhs
+					}
+				case 2:
+					typ1 = yieldType.In(0)
+					typ2 = yieldType.In(1)
+				default:
+					panic(tc.errorf(node.Assignment.Rhs[0], "cannot range over %s (type %s)", expr, ti.StringWithNumber(true)))
+				}
 			default:
 				panic(tc.errorf(node.Assignment.Rhs[0], "cannot range over %s (type %s)", expr, ti.StringWithNumber(true)))
 			}

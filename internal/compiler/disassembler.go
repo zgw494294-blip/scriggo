@@ -273,7 +273,7 @@ func disassembleFunction(b *bytes.Buffer, globals []Global, fn *runtime.Function
 		case runtime.OpCallFunc, runtime.OpCallMacro, runtime.OpCallIndirect, runtime.OpCallNative,
 			runtime.OpTailCall, runtime.OpSlice, runtime.OpStringSlice:
 			addr += 1
-		case runtime.OpDefer:
+		case runtime.OpDefer, runtime.OpRangeFunc:
 			addr += 2
 		}
 		if in.Op == runtime.OpMakeSlice && in.B > 0 {
@@ -626,6 +626,10 @@ func disassembleInstruction(fn *runtime.Function, globals []Global, addr runtime
 		s += " " + disassembleOperand(fn, a, reflect.String, k)
 		s += " " + disassembleOperand(fn, b, reflect.Int, false)
 		s += " " + disassembleOperand(fn, c, reflect.Int, false)
+	case runtime.OpRangeFunc:
+		s += " " + disassembleOperand(fn, a, reflect.Interface, false)
+		s += " " + disassembleOperand(fn, b, getKind('b', fn, addr), false)
+		s += " " + disassembleOperand(fn, c, getKind('c', fn, addr), false)
 	case runtime.OpRealImag:
 		s += " " + disassembleOperand(fn, a, reflect.Interface, k)
 		s += " " + disassembleOperand(fn, b, reflect.Float64, false)
@@ -1088,6 +1092,8 @@ var operationName = [...]string{
 	runtime.OpPrint: "Print",
 
 	runtime.OpRange: "Range",
+
+	runtime.OpRangeFunc: "RangeFunc",
 
 	runtime.OpRangeString: "Range",
 

@@ -96,7 +96,70 @@ type VM struct {
 	cases    []reflect.SelectCase // select cases.
 	panic    *PanicError          // panic.
 	main     bool                 // reports whether this VM is executing the main goroutine.
+
+	// rangeStack contains the states of the active range-over-function
+	// loops. See the documentation of rangeFnState for details.
+	rangeStack []*rangeFnState
+
+	// pendingRangeReturn is the state of the range-over-function loop whose
+	// body executed a return statement.
+	pendingRangeReturn *rangeFnState
 }
+
+// rangeFnState represents the state of an active range-over-function loop.
+// An instance is created when an OpRangeFunc instruction is executed and
+// removed when the iteration function returns.
+type rangeFnState struct {
+
+	// fn, fp, vars and renderer are the function, frame pointer, variables
+	// and renderer of the function that lexically contains the range body.
+	// They are restored when the body is executed as a yield callback.
+	fn       *Function
+	fp       [4]Addr
+	vars     []reflect.Value
+	renderer *renderer
+
+	// index and elem are the registers, in the frame of fn, where the
+	// values passed to yield are stored. A zero value means no variable.
+	index int8
+	elem  int8
+
+	// rangeAddress is the address used to compare the result of a continue
+	// statement, and bodyAddress is the address of the first instruction of
+	// the body.
+	rangeAddress Addr
+	bodyAddress  Addr
+
+	// inBody reports whether the body of the range statement is currently
+	// being executed.
+	inBody bool
+
+	// callerFP and returnPC identify the call frame pushed for an
+	// interpreted iteration function, so the state can be removed when the
+	// function returns. interp reports whether the iteration function is an
+	// interpreted function.
+	callerFP [4]Addr
+	returnPC Addr
+	interp   bool
+
+	// frameSize is the size of the frame of the interpreted iteration
+	// function, relative to the frame of the owning function. It is used to
+	// position the frames of nested iteration functions so they do not
+	// overlap.
+	frameSize [4]Addr
+}
+
+// rangeReturnPanic is the panic used internally to implement a return
+// statement in the body of a range-over-function loop. It unwinds the active
+// iteration functions, running their deferred calls, and is then converted
+// into a return of the function that lexically contains the body.
+type rangeReturnPanic struct {
+	st *rangeFnState
+}
+
+// errRangeReturn is returned by runRecoverable when a rangeReturnPanic is
+// recovered, and handled in runFunc.
+var errRangeReturn = errors.New("range over function return")
 
 // NewVM returns a new virtual machine.
 func NewVM() *VM {
@@ -126,6 +189,8 @@ func (vm *VM) Reset() {
 		vm.cases = vm.cases[:0]
 	}
 	vm.panic = nil
+	vm.rangeStack = nil
+	vm.pendingRangeReturn = nil
 }
 
 // stop is called in the vm.run method to stop the execution.
@@ -531,6 +596,7 @@ func (vm *VM) nextCall() bool {
 		switch call.status {
 		case started:
 			// A call is returned, continue with the previous call.
+			vm.popRangeStateForCall(call)
 		case tailed:
 			// A tail call is returned, continue with the previous call.
 			continue
@@ -574,6 +640,60 @@ func (vm *VM) nextCall() bool {
 				}
 			}
 			continue
+		case rangeReturned:
+			// The return of the function that owns the body of a
+			// range-over-function loop is completing: run its remaining
+			// deferred calls, swapping the frames as for a normal return,
+			// and then resume its caller. The named results have already
+			// been finalized when the return statement was executed in the
+			// body.
+			if i > 0 {
+				prev := vm.calls[i-1]
+				if prev.status == deferred {
+					vm.swapStack(&prev.fp, &call.fp, call.cl.fn.NumReg)
+					call, vm.calls[i-1] = prev, call
+					break
+				}
+			}
+			continue
+		case rangeReturning:
+			// Marker for a return statement executed in the body of a
+			// range-over-function loop. The deferred calls above the frame
+			// of the owning function are run, as in a panic unwind but
+			// without making the recover function return a value. Once the
+			// frame of the owning function is reached, the function returns
+			// to its caller.
+			target := call.rangeOwner
+			for i = i - 1; i >= 0; i-- {
+				d := vm.calls[i]
+				switch d.status {
+				case deferred:
+					// Run the deferred call.
+					vm.calls[i] = vm.calls[i+1]
+					vm.calls[i].status = rangeReturning
+					call = d
+					if d.cl.fn != nil {
+						i++
+					}
+					goto execute
+				case started:
+					if d.rangeOwner == target {
+						// Frame of an iteration function: skip it.
+						continue
+					}
+					// The frame of the owning function has been reached:
+					// discard the iteration frames, complete its return
+					// and resume its caller.
+					vm.calls = append(vm.calls[:i+1], callFrame{cl: callable{fn: target}, renderer: vm.renderer, fp: call.fp, status: rangeReturned})
+					vm.fn = nil
+					return vm.nextCall()
+				}
+			}
+			// The owning function has no call frame, it is the main
+			// function: remove the marker and the remaining iteration
+			// frames and terminate the execution.
+			vm.calls = vm.calls[:0]
+			return false
 		case panicked:
 			// A call is panicked, the first deferred call in the call stack,
 			// if there is one, will be executed.
@@ -589,6 +709,7 @@ func (vm *VM) nextCall() bool {
 				}
 			}
 		}
+	execute:
 		if i >= 0 {
 			if call.cl.fn != nil {
 				vm.calls = vm.calls[:i]
@@ -604,6 +725,148 @@ func (vm *VM) nextCall() bool {
 		}
 	}
 	return false
+}
+
+// ownerRangeState returns the state of the innermost active
+// range-over-function loop whose body is currently executing and whose
+// owning function is the function currently executed by the VM, or nil.
+func (vm *VM) ownerRangeState() *rangeFnState {
+	for i := len(vm.rangeStack) - 1; i >= 0; i-- {
+		st := vm.rangeStack[i]
+		if st.inBody && st.fn == vm.fn {
+			return st
+		}
+	}
+	return nil
+}
+
+// popRangeStateForCall removes the state of the active range-over-function
+// loop if its interpreted iteration function returns to call.
+func (vm *VM) popRangeStateForCall(call callFrame) {
+	if n := len(vm.rangeStack); n > 0 {
+		st := vm.rangeStack[n-1]
+		if st.interp && st.callerFP == call.fp && st.returnPC == call.pc {
+			vm.rangeStack = vm.rangeStack[:n-1]
+		}
+	}
+}
+
+// callRangeYield executes the body of a range-over-function loop in response
+// to a call of the implicit yield function from an interpreted iteration
+// function. It returns Addr(0), true if the execution can continue with the
+// instruction that follows the call, otherwise it returns the address and
+// the value returned by the recursive execution of the body.
+func (vm *VM) callRangeYield(f *callable) (Addr, bool) {
+	st := f.yield
+	off := vm.fn.Body[vm.pc]
+	retPC := vm.pc + 1
+	yieldType := vm.fn.Type.In(0)
+	n := yieldType.NumIn()
+	// Get the arguments from the iteration function frame.
+	savedFP := vm.fp
+	vm.fp[0] += Addr(off.Op)
+	vm.fp[1] += Addr(off.A)
+	vm.fp[2] += Addr(off.B)
+	vm.fp[3] += Addr(off.C)
+	args := make([]reflect.Value, n)
+	// In the calling convention of an interpreted function, the registers of
+	// the results precede the registers of the arguments, for each kind of
+	// register.
+	var outCount, inCount [4]int
+	for o := range yieldType.NumOut() {
+		outCount[kindToType[yieldType.Out(o).Kind()]]++
+	}
+	for i := range n {
+		args[i] = reflect.New(yieldType.In(i)).Elem()
+		t := kindToType[args[i].Kind()]
+		reg := int8(1 + outCount[t] + inCount[t])
+		inCount[t]++
+		vm.getIntoReflectValue(reg, args[i], false)
+	}
+	vm.fp = savedFP
+	cont, stopped := vm.callRangeYieldBody(st, args)
+	// Set the bool result in the iteration function frame.
+	vm.fp[0] = savedFP[0] + Addr(off.Op)
+	vm.setBool(1, cont)
+	vm.fp = savedFP
+	if stopped {
+		return maxUint32, false
+	}
+	vm.pc = retPC
+	return 0, true
+}
+
+// callRangeYieldBody executes the body of the range statement in the frame
+// of the function that owns it, passing the arguments of yield to the range
+// variables. It returns false as first value if the body ended with a break
+// statement (so yield returns false), and stopped as second value if the
+// execution was stopped, for example because the context was canceled.
+func (vm *VM) callRangeYieldBody(st *rangeFnState, args []reflect.Value) (cont bool, stopped bool) {
+	ofn, ofp, ovars, orenderer := vm.fn, vm.fp, vm.vars, vm.renderer
+	st.inBody = true
+	vm.fn = st.fn
+	vm.fp = st.fp
+	vm.vars = st.vars
+	vm.renderer = st.renderer
+	switch len(args) {
+	case 1:
+		if st.elem != 0 {
+			vm.setFromReflectValue(st.elem, args[0])
+		}
+	case 2:
+		if st.index != 0 {
+			vm.setFromReflectValue(st.index, args[0])
+		}
+		if st.elem != 0 {
+			vm.setFromReflectValue(st.elem, args[1])
+		}
+	}
+	vm.pc = st.bodyAddress
+	addr, breakOut := vm.run()
+	vm.fn = ofn
+	vm.fp = ofp
+	vm.vars = ovars
+	vm.renderer = orenderer
+	st.inBody = false
+	if breakOut {
+		return false, false
+	}
+	if addr != st.rangeAddress {
+		return false, true
+	}
+	return true, false
+}
+
+// beginRangeReturn starts the completion of a return statement executed in
+// the body of a range-over-function loop. It appends a marker frame to the
+// call stack and replays the deferred calls using nextCall, running first
+// the deferred calls of the iteration functions and then the deferred calls
+// of the function that owns the body. It returns false if the execution has
+// terminated.
+func (vm *VM) beginRangeReturn() bool {
+	st := vm.pendingRangeReturn
+	vm.pendingRangeReturn = nil
+	// Remove the state of the loop and the states of the nested loops,
+	// keeping the states of outer loops whose iteration functions are still
+	// running.
+	for i, s := range vm.rangeStack {
+		if s == st {
+			vm.rangeStack = vm.rangeStack[:i]
+			break
+		}
+	}
+	vm.fn = st.fn
+	vm.fp = st.fp
+	vm.vars = st.vars
+	vm.renderer = st.renderer
+	vm.calls = append(vm.calls, callFrame{
+		cl:         callable{fn: st.fn, vars: st.vars},
+		renderer:   vm.renderer,
+		fp:         st.fp,
+		status:     rangeReturning,
+		rangeOwner: st.fn,
+	})
+	return vm.nextCall()
 }
 
 // create creates a new virtual machine with the execution environment env.
@@ -871,6 +1134,8 @@ const (
 	deferred
 	panicked
 	recovered
+	rangeReturning
+	rangeReturned
 )
 
 // If the size of callFrame changes, update the constant CallFrameSize.
@@ -881,6 +1146,13 @@ type callFrame struct {
 	pc          Addr       // program counter.
 	status      callStatus // status.
 	numVariadic int8       // number of variadic arguments.
+
+	// rangeOwner, if not nil, marks a frame that belongs to the execution
+	// of a range-over-function loop owned by the function rangeOwner. It is
+	// set on the call frame of interpreted iteration functions and on the
+	// deferred call frames registered in a range body, and is used to
+	// implement return, break and defer in range-over-function loops.
+	rangeOwner *Function
 }
 
 type callable struct {
@@ -888,6 +1160,11 @@ type callable struct {
 	fn     *Function       // function, if it is a Scriggo function.
 	native *NativeFunction // native function.
 	vars   []reflect.Value // non-local (global and closure) variables.
+
+	// yield, if not nil, indicates that the callable is the implicit yield
+	// function of a range-over-function loop. Calling it executes the body
+	// of the loop.
+	yield *rangeFnState
 }
 
 // Native returns the native function of a callable.
@@ -1157,6 +1434,8 @@ const (
 	OpPrint
 
 	OpRange
+
+	OpRangeFunc
 
 	OpRangeString
 
